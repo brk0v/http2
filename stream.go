@@ -584,15 +584,15 @@ func (st *stream) removeDependent() {
 	} else {
 		// Stream is a root.
 		st.removeRoots()
-
 		// sibs become roots.
-		for s := st.depNext; s != nil; s = s.sibNext {
+		for s := st.depNext; s != nil; {
+			next := s.sibNext // save for loop
 			s.depPrev = nil
 			s.sibPrev = nil
 			s.sibNext = nil
-
 			s.weightEff = s.weight
 			s.moveRoots()
+			s = next
 		}
 	}
 

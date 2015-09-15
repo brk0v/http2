@@ -191,12 +191,14 @@ func (ws *writeScheduler) take() (wm frameWriteMsg, ok bool) {
 		//  * writeQueue's s is niled because of forgetStream() call (e.g. got RST);
 		//  * writeQueue was reused by getEmptyQueue() with another stream id.
 		if st == nil || q.streamID() != id {
+			ws.vlogf("st == nil || q.streamID() != id stream %d %d\n", q.streamID(), id)
 			continue
 		}
 
 		// We have higher priority data to sent. This protects us from sending
 		// old stale data after reprioritization and rebuilding dependency tree.
 		if st.depState != depStateTop {
+			ws.vlogf("st.depState != depStateTop stream: %d\n", st.id)
 			continue
 		}
 
@@ -212,22 +214,27 @@ func (ws *writeScheduler) take() (wm frameWriteMsg, ok bool) {
 				if !q.empty() {
 					q.vf = ws.lvf + q.calcVirtFinish(st.weightEff)
 					ws.canSend.push(q)
+					ws.vlogf("writeScheduler take() pushs data on stream: %d\n", st.id)
 				} else {
 					// No data to send and stream is alive so just unblock
 					// dependency tree.
+					ws.vlogf("writeScheduler take() sets depStateIdle to stream: %d\n", st.id)
 					st.setDepState(depStateIdle)
 				}
 			}
+			ws.vlogf("writeScheduler take() returns: %s state: %s\n", wm, st.depState)
 			return wm, ok
 		default:
 			if st.flow.availableConn() == 0 {
 				// Don't have enough connection flow: so put stream queue back
 				// in the pq without virtual last recalculation.
+				ws.vlogf("writeScheduler not enough connection flow: %s state: %s\n", wm, st.depState)
 				ws.canSend.push(q)
 				return
 			} else {
 				// Don't have enough stream flow: unblock dependency tree and
 				// start waiting for WINDOW_UPDATE frame.
+				ws.vlogf("writeScheduler not enough stream flow: %d depState: %s state; %s gotreset: %v\n", st.id, st.depState, st.state, st.gotReset)
 				st.setDepState(depStateFlowDefer)
 				return
 			}
@@ -311,6 +318,7 @@ func (ws *writeScheduler) takeFrom(id uint32, q *writeQueue) (wm frameWriteMsg, 
 
 func (ws *writeScheduler) forgetStream(id uint32) {
 	ws.vlogf("writeScheduler forgetStream: %d\n", id)
+
 	q, ok := ws.sq[id]
 	if !ok {
 		return

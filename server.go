@@ -257,6 +257,7 @@ func (srv *Server) handleConn(hs *http.Server, c net.Conn, h http.Handler) {
 		maxSavedClosedStreams: srv.maxSavedClosedStreams(),
 		maxPushID:             2,
 		clientMaxStreams:      defaultClientMaxStreams,
+		pushedResources:       make(map[string]bool),
 	}
 	sc.flow.add(initialWindowSize)
 	sc.inflow.add(initialWindowSize)
@@ -416,8 +417,9 @@ type serverConn struct {
 	closeds               *list.List // closed streams that retained for proper priority
 	maxSavedClosedStreams int
 	// Owned by the writeFrameAsync goroutine:
-	headerWriteBuf bytes.Buffer
-	hpackEncoder   *hpack.Encoder
+	headerWriteBuf  bytes.Buffer
+	hpackEncoder    *hpack.Encoder
+	pushedResources map[string]bool
 }
 
 // requestParam is the state of a request.
@@ -1144,7 +1146,6 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 	} else {
 		sc.curOpenStreams--
 	}
-
 	st.setState(sc, stateClosed)
 
 	if p := st.body; p != nil {
@@ -1348,11 +1349,22 @@ func (sc *serverConn) processHeaders(f *HeadersFrame) error {
 	return sc.processHeaderBlockFragment(st, f.HeaderBlockFragment(), f.HeadersEnded())
 }
 
-var ErrPushDisabled = errors.New("http2: push attempted on connection where it is disabled")
-var ErrPushLimitReached = errors.New("http2: push attempted to send when SETTINGS_MAX_CONCURRENT_STREAMS is reached")
+var (
+	ErrPushDisabled      = errors.New("http2: push attempted on connection where it is disabled")
+	ErrPushLimitReached  = errors.New("http2: push attempted to send when SETTINGS_MAX_CONCURRENT_STREAMS is reached")
+	ErrPushAlreadySent   = errors.New("http2: resource alredy pushed")
+	ErrPushInvalidMethod = errors.New("http2: invalid method for push promise")
+)
 
 func (sc *serverConn) startPushPromise(pp *pushPromise) {
 	sc.serveG.check()
+	if _, ok := sc.pushedResources[pp.reqpm.path]; ok && pp.once {
+		// alredy pushed - nothing to do
+		pp.done <- ErrPushAlreadySent
+		return
+	}
+	sc.pushedResources[pp.reqpm.path] = true
+
 	if !sc.pushEnabled {
 		pp.done <- ErrPushDisabled
 		return
@@ -1890,6 +1902,7 @@ func (w *responseWriter) Flush() {
 
 type pushPromise struct {
 	reqpm requestParam
+	once  bool
 	done  chan error
 }
 
@@ -1898,10 +1911,10 @@ type pushPromise struct {
 // headers. It will then initiate the push by calling the server-level http.Handler
 // for the path.
 type Pusher interface {
-	Push(method string, path string, h http.Header) error
+	Push(method string, path string, h http.Header, once bool) error
 }
 
-func (w *responseWriter) Push(method string, path string, h http.Header) error {
+func (w *responseWriter) Push(method string, path string, h http.Header, once bool) error {
 	rws := w.rws
 	if rws == nil {
 		panic("Push called after Handler finished")
@@ -1912,7 +1925,11 @@ func (w *responseWriter) Push(method string, path string, h http.Header) error {
 	switch method {
 	case "GET", "HEAD":
 	default:
-		return errors.New("http2: invalid method for push promise")
+		return ErrPushInvalidMethod
+	}
+	authority := rws.req.Host
+	if h.Get("Host") != "" {
+		authority = h.Get("Host")
 	}
 	pp := pushPromise{
 		reqpm: requestParam{
@@ -1921,9 +1938,13 @@ func (w *responseWriter) Push(method string, path string, h http.Header) error {
 			method:    method,
 			path:      path,
 			scheme:    "https",
-			authority: rws.req.Host,
+			authority: authority,
 		},
 		done: rws.frameWriteCh,
+	}
+	// push resource only one time in this connection
+	if once {
+		pp.once = true
 	}
 	return rws.conn.pushPromise(&pp)
 }
